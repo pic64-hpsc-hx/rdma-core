@@ -1,0 +1,8 @@
+/* Export symbols should be added below according to
+   Documentation/versioning.md document. */
+GRVF_1.0 {
+	/*
+	global:
+	*/
+	local: *;
+};
