@@ -803,8 +803,8 @@ static struct verbs_context *grvf_alloc_context(struct ibv_device *device,
 	if (!context)
 		return NULL;
 
-	ret = ibv_cmd_get_context(&context->ibv_ctx, &cmd, sizeof(cmd), &resp,
-				  sizeof(resp));
+	ret = ibv_cmd_get_context(&context->ibv_ctx, &cmd, sizeof(cmd), NULL,
+				  &resp, sizeof(resp));
 	if (ret) {
 		verbs_err(&context->ibv_ctx,
 			  "Failed to get ucontext, err: %d\n", ret);
