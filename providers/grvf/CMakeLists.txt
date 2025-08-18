@@ -5,6 +5,8 @@ rdma_shared_provider(grvf libgrvf.map
 )
 
 publish_headers(infiniband
+  ../../kernel-headers/rdma/grvf_user_ioctl_verbs.h
+  grvf_api.h
   grvfdv.h
 )
 

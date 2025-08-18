@@ -1,8 +1,11 @@
 /* Export symbols should be added below according to
    Documentation/versioning.md document. */
 GRVF_1.0 {
-	/*
 	global:
-	*/
+		grvfdv_modify_qp_custom;
+		grvfdv_query_tx_dbg_mon;
+		grvfdv_query_rx_dbg_mon;
+		grvfdv_query_global_dbg_mon;
+		grvfdv_query_cnp;
 	local: *;
 };

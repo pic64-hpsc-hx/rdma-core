@@ -16,6 +16,15 @@
  */
 #define GRVF_IB_UVERBS_ABI_VERSION 1
 
+struct grvf_ib_create_ah_resp {
+	__u8 smac[ETH_ALEN];
+	__u8 reserved[2];
+};
+
+struct grvf_ib_alloc_pd_resp {
+	__u32 index;
+};
+
 union grvf_gid {
 	__u8 raw[16];
 	struct {

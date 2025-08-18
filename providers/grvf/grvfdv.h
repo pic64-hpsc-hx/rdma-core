@@ -6,14 +6,32 @@
 #ifndef GRVFDV_H
 #define GRVFDV_H
 
-#include <stdint.h>
+#include <infiniband/grvf_api.h>
 
-typedef uint64_t u64;
-typedef uint32_t u32;
-typedef uint16_t u16;
-typedef uint8_t u8;
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-#include "bare/drv-queue-types.h"
-#include "bare/drv-cmd64.h"
+int grvfdv_modify_qp_custom(struct ibv_qp *ibvqp,
+			    struct grvfdv_qp_custom_attr *attr, int attr_mask);
+
+int grvfdv_query_tx_dbg_mon(struct ibv_context *context,
+			    enum grvfdv_dbg_mon_tx_events_type event_type,
+			    uint32_t *counter);
+
+int grvfdv_query_rx_dbg_mon(struct ibv_context *context,
+			    enum grvfdv_dbg_mon_rx_events_type event_type,
+			    uint32_t *counter);
+
+int grvfdv_query_global_dbg_mon(
+	struct ibv_context *context,
+	enum grvfdv_dbg_mon_global_events_type event_type, uint32_t *counter);
+
+int grvfdv_query_cnp(struct ibv_qp *ibvqp,
+		     struct grvfdv_congestion_cnp_attrs *attr);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

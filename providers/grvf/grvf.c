@@ -10,6 +10,8 @@
 #include <sys/mman.h>
 #include <sys/param.h> /* For MAX macro */
 #include <infiniband/driver.h>
+#include <rdma/ib_user_ioctl_cmds.h>
+#include <rdma/grvf_user_ioctl_cmds.h>
 #include <util/mmio.h>
 #if 1
 /* FIXME */
@@ -22,98 +24,85 @@
 #include "grvf_util.h"
 #include "grvf_ip.h"
 #include "grvf_post.h"
+#include "grvf_bare.h"
 #include "grvfdv.h"
 
-static struct ibv_mw *grvf_alloc_mw(struct ibv_pd *pd, enum ibv_mw_type type)
+#define READ_CQ(entry, member, cq)                                             \
+	(entry.member) =                                                       \
+		mmio_read64(&((cq)->dev[((cq)->cons << CQ_ENTRY_STRIDE_BITS) + \
+					offsetof(typeof(entry), member)]))
+
+#define WRITE_CQ(entry, member, cq, val)                                       \
+	mmio_write64(&((cq)->dev[((cq)->cons << CQ_ENTRY_STRIDE_BITS) +        \
+				 offsetof(typeof(entry), member)]),            \
+		     (val))
+
+static void grvf_async_event(struct ibv_context *context,
+			     struct ibv_async_event *event)
 {
-	struct ibv_mw *mw;
-	struct ibv_alloc_mw cmd;
-	struct ib_uverbs_alloc_mw_resp resp;
+	struct grvf_context *ctx;
+
+	switch (event->event_type) {
+	case IBV_EVENT_DEVICE_FATAL:
+		ctx = to_gctx(context);
+		ctx->ibv_active = false;
+		break;
+	default:
+		break;
+	}
+}
+
+static struct ibv_dm *grvf_alloc_dm(struct ibv_context *context,
+				    struct ibv_alloc_dm_attr *attr)
+{
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_DM, UVERBS_METHOD_DM_ALLOC,
+			       0);
+	struct grvf_dm *dm;
 	int ret;
 
-	mw = calloc(1, sizeof(*mw));
-	if (!mw)
+	dm = calloc(1, sizeof(*dm));
+	if (!dm)
 		return NULL;
 
-	ret = ibv_cmd_alloc_mw(pd, type, mw, &cmd, sizeof(cmd), &resp,
-			       sizeof(resp));
+	ret = ibv_cmd_alloc_dm(context, attr, &dm->vdm, cmdb);
 	if (ret) {
-		verbs_err(verbs_get_ctx(pd->context),
-			  "Failed to allocate MW\n");
+		verbs_err(verbs_get_ctx(context), "Failed to allocate DM\n");
 		errno = ret;
-		free(mw);
+		free(dm);
 		return NULL;
 	}
-	return mw;
+
+	dm->length = attr->length;
+	return &dm->vdm.dm;
 }
 
 static struct ibv_pd *grvf_alloc_pd(struct ibv_context *context)
 {
-	struct ibv_pd *pd;
+	struct grvf_pd *pd;
 	struct ibv_alloc_pd cmd;
-	struct ib_uverbs_alloc_pd_resp resp;
+	struct grvf_alloc_pd_resp resp;
 	int ret;
 
 	pd = calloc(1, sizeof(*pd));
 	if (!pd)
 		return NULL;
 
-	ret = ibv_cmd_alloc_pd(context, pd, &cmd, sizeof(cmd), &resp,
-			       sizeof(resp));
+	ret = ibv_cmd_alloc_pd(context, &pd->ibvpd, &cmd, sizeof(cmd),
+			       &resp.ibv_resp, sizeof(resp));
 	if (ret) {
 		verbs_err(verbs_get_ctx(context), "Failed to allocate PD\n");
 		errno = ret;
 		free(pd);
 		return NULL;
 	}
-	return pd;
+
+	pd->index = resp.index;
+
+	return &pd->ibvpd;
 }
 
 static int grvf_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
 			  struct ibv_send_wr **bad_wr);
-
-static int grvf_bind_mw(struct ibv_qp *qp, struct ibv_mw *mw,
-			struct ibv_mw_bind *mw_bind)
-{
-	struct ibv_mw_bind_info *bind_info = &mw_bind->bind_info;
-	struct ibv_send_wr wr = {};
-	struct ibv_send_wr *bad_wr = NULL;
-	int ret;
-
-	if (bind_info->mw_access_flags & IBV_ACCESS_ZERO_BASED) {
-		errno = EINVAL;
-		return errno;
-	}
-
-	if (bind_info->mr) {
-		if (verbs_get_mr(bind_info->mr)->mr_type != IBV_MR_TYPE_MR) {
-			errno = ENOTSUP;
-			return errno;
-		}
-#if 0
-		// TODO:
-		if (bind_info->mr->alloc_flags & IBV_ACCESS_ZERO_BASED) {
-			errno = EINVAL;
-			return errno;
-		}
-#endif
-	}
-
-	wr.opcode = IBV_WR_BIND_MW;
-	wr.next = NULL;
-	wr.wr_id = mw_bind->wr_id;
-	wr.send_flags = mw_bind->send_flags;
-	wr.bind_mw.bind_info = mw_bind->bind_info;
-	wr.bind_mw.mw = mw;
-	wr.bind_mw.rkey = ibv_inc_rkey(mw->rkey);
-
-	ret = grvf_post_send(qp, &wr, &bad_wr);
-	if (ret)
-		return ret;
-
-	mw->rkey = wr.bind_mw.rkey;
-	return 0;
-}
 
 static struct ibv_ah *grvf_create_ah(struct ibv_pd *pd,
 				     struct ibv_ah_attr *attr)
@@ -145,6 +134,7 @@ static struct ibv_ah *grvf_create_ah(struct ibv_pd *pd,
 		return NULL;
 	}
 
+	memcpy(ah->av.smac, resp.smac, sizeof(resp.smac));
 	ah->av.port_num = attr->port_num;
 	ah->av.network_type = IN6_IS_ADDR_V4MAPPED(attr->grh.dgid.raw) ?
 				      GRVF_NETWORK_TYPE_IPV4 :
@@ -161,6 +151,7 @@ static struct ibv_ah *grvf_create_ah(struct ibv_pd *pd,
 		free(ah);
 		return NULL;
 	}
+
 	return &ah->ibv_ah;
 }
 
@@ -185,7 +176,16 @@ static struct ibv_cq *grvf_create_cq(struct ibv_context *context, int cqe,
 		return NULL;
 	}
 
-	cq->size_mask = upper_power_of_two(cqe) - 1;
+	cq->cons = 0;
+	cq->size_mask = cq->vcq.cq.cqe - 1;
+
+	if (upper_power_of_two(cq->size_mask) != cq->vcq.cq.cqe) {
+		verbs_err(verbs_get_ctx(context), "Internal error\n");
+		errno = EINVAL;
+		ibv_cmd_destroy_cq(&cq->vcq.cq);
+		free(cq);
+		return NULL;
+	}
 
 	cq->dev = mmap(NULL, resp.mi.size, PROT_READ | PROT_WRITE, MAP_SHARED,
 		       context->cmd_fd, resp.mi.offset);
@@ -201,6 +201,238 @@ static struct ibv_cq *grvf_create_cq(struct ibv_context *context, int cqe,
 	pthread_spin_init(&cq->lock, PTHREAD_PROCESS_PRIVATE);
 
 	return &cq->vcq.cq;
+}
+
+static inline void wc_dev_to_uverbs_wc(struct cq_entry_t *wc_dev,
+				       struct ib_uverbs_wc *wc)
+{
+	wc->wr_id = wc_dev->wc.wr_id;
+	wc->status = (enum ibv_wc_status)wc_dev->wc.status;
+	wc->opcode = (enum ibv_wc_opcode)wc_dev->wc.opcode;
+	wc->vendor_err = wc_dev->wc.verndor_err;
+	wc->byte_len = wc_dev->wc.byte_len;
+
+	//this moves inv_key as well
+	wc->ex.imm_data = wc_dev->wc.imm_data;
+
+	wc->qp_num = wc_dev->wc.qp_num;
+	wc->src_qp = wc_dev->wc.src_qp;
+	wc->wc_flags = wc_dev->wc.wc_flags;
+	wc->pkey_index = wc_dev->wc.pkey_index;
+}
+
+static int cq_start_poll(struct ibv_cq_ex *current,
+			 struct ibv_poll_cq_attr *attr)
+{
+	struct grvf_cq *cq = container_of(current, struct grvf_cq, vcq.cq_ex);
+	struct cq_entry_t wc_dev;
+
+	pthread_spin_lock(&cq->lock);
+
+	READ_CQ(wc_dev, raw.qw4, cq);
+	if (!(wc_dev.raw.flag & CQ_FLAG_RDY)) {
+		pthread_spin_unlock(&cq->lock);
+		errno = ENOENT;
+		return errno;
+	}
+
+	READ_CQ(wc_dev, raw.qw0, cq);
+	READ_CQ(wc_dev, raw.qw1, cq);
+	READ_CQ(wc_dev, raw.qw2, cq);
+	READ_CQ(wc_dev, raw.qw3, cq);
+
+	wc_dev_to_uverbs_wc(&wc_dev, &cq->wc);
+	cq->vcq.cq_ex.status = (enum ibv_wc_status)wc_dev.wc.status;
+	cq->vcq.cq_ex.wr_id = wc_dev.wc.wr_id;
+
+	WRITE_CQ(wc_dev, raw.qw4, cq, 0);
+
+	return 0;
+}
+
+static int cq_next_poll(struct ibv_cq_ex *current)
+{
+	struct grvf_cq *cq = container_of(current, struct grvf_cq, vcq.cq_ex);
+	struct cq_entry_t wc_dev;
+
+	++cq->cons;
+	cq->cons &= cq->size_mask;
+
+	READ_CQ(wc_dev, raw.qw4, cq);
+	if (!(wc_dev.raw.flag & CQ_FLAG_RDY)) {
+		pthread_spin_unlock(&cq->lock);
+		errno = ENOENT;
+		return errno;
+	}
+
+	READ_CQ(wc_dev, raw.qw0, cq);
+	READ_CQ(wc_dev, raw.qw1, cq);
+	READ_CQ(wc_dev, raw.qw2, cq);
+	READ_CQ(wc_dev, raw.qw3, cq);
+
+	wc_dev_to_uverbs_wc(&wc_dev, &cq->wc);
+	cq->vcq.cq_ex.status = (enum ibv_wc_status)wc_dev.wc.status;
+	cq->vcq.cq_ex.wr_id = wc_dev.wc.wr_id;
+
+	WRITE_CQ(wc_dev, raw.qw4, cq, 0);
+
+	return 0;
+}
+
+static void cq_end_poll(struct ibv_cq_ex *current)
+{
+	struct grvf_cq *cq = container_of(current, struct grvf_cq, vcq.cq_ex);
+
+	++cq->cons;
+	cq->cons &= cq->size_mask;
+	pthread_spin_unlock(&cq->lock);
+}
+
+static enum ibv_wc_opcode cq_read_opcode(struct ibv_cq_ex *current)
+{
+	struct grvf_cq *cq = container_of(current, struct grvf_cq, vcq.cq_ex);
+
+	return cq->wc.opcode;
+}
+
+static uint32_t cq_read_vendor_err(struct ibv_cq_ex *current)
+{
+	struct grvf_cq *cq = container_of(current, struct grvf_cq, vcq.cq_ex);
+
+	return cq->wc.vendor_err;
+}
+
+static uint32_t cq_read_byte_len(struct ibv_cq_ex *current)
+{
+	struct grvf_cq *cq = container_of(current, struct grvf_cq, vcq.cq_ex);
+
+	return cq->wc.byte_len;
+}
+
+static __be32 cq_read_imm_data(struct ibv_cq_ex *current)
+{
+	struct grvf_cq *cq = container_of(current, struct grvf_cq, vcq.cq_ex);
+
+	return cq->wc.ex.imm_data;
+}
+
+static uint32_t cq_read_qp_num(struct ibv_cq_ex *current)
+{
+	struct grvf_cq *cq = container_of(current, struct grvf_cq, vcq.cq_ex);
+
+	return cq->wc.qp_num;
+}
+
+static uint32_t cq_read_src_qp(struct ibv_cq_ex *current)
+{
+	struct grvf_cq *cq = container_of(current, struct grvf_cq, vcq.cq_ex);
+
+	return cq->wc.src_qp;
+}
+
+static unsigned int cq_read_wc_flags(struct ibv_cq_ex *current)
+{
+	struct grvf_cq *cq = container_of(current, struct grvf_cq, vcq.cq_ex);
+
+	return cq->wc.wc_flags;
+}
+
+static uint32_t cq_read_slid(struct ibv_cq_ex *current)
+{
+	struct grvf_cq *cq = container_of(current, struct grvf_cq, vcq.cq_ex);
+
+	return cq->wc.slid;
+}
+
+static uint8_t cq_read_sl(struct ibv_cq_ex *current)
+{
+	struct grvf_cq *cq = container_of(current, struct grvf_cq, vcq.cq_ex);
+
+	return cq->wc.sl;
+}
+
+static struct ibv_cq_ex *grvf_create_cq_ex(struct ibv_context *context,
+					   struct ibv_cq_init_attr_ex *attr)
+{
+	struct grvf_cq *cq;
+	struct grvf_create_cq_ex_resp resp;
+	int ret;
+
+	if (attr->wc_flags & ~(IBV_WC_EX_WITH_BYTE_LEN | IBV_WC_EX_WITH_IMM |
+			       IBV_WC_EX_WITH_QP_NUM | IBV_WC_EX_WITH_SRC_QP |
+			       IBV_WC_EX_WITH_SLID | IBV_WC_EX_WITH_SL)) {
+		verbs_err(verbs_get_ctx(context), "Flags are not supported\n");
+		errno = EOPNOTSUPP;
+		goto err;
+	}
+
+	cq = calloc(1, sizeof(*cq));
+	if (!cq)
+		return NULL;
+
+	ret = ibv_cmd_create_cq_ex(context, attr, &cq->vcq, NULL, 0,
+				   &resp.ibv_resp, sizeof(resp), 0);
+	if (ret) {
+		verbs_err(verbs_get_ctx(context),
+			  "Failed to create extended CQ\n");
+		errno = ret;
+		goto err_free;
+	}
+
+	cq->cons = 0;
+	cq->size_mask = cq->vcq.cq_ex.cqe - 1;
+
+	if (upper_power_of_two(cq->size_mask) != cq->vcq.cq_ex.cqe) {
+		verbs_err(verbs_get_ctx(context), "Internal error\n");
+		errno = EINVAL;
+		goto err_destroy;
+	}
+
+	cq->dev = mmap(NULL, resp.mi.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+		       context->cmd_fd, resp.mi.offset);
+	if ((void *)cq->dev == MAP_FAILED) {
+		verbs_err(verbs_get_ctx(context),
+			  "Failed mmap for create CQ\n");
+		goto err_destroy;
+	}
+
+	cq->mmap_info = resp.mi;
+	pthread_spin_init(&cq->lock, PTHREAD_PROCESS_PRIVATE);
+
+	cq->vcq.cq_ex.start_poll = cq_start_poll;
+	cq->vcq.cq_ex.next_poll = cq_next_poll;
+	cq->vcq.cq_ex.end_poll = cq_end_poll;
+	cq->vcq.cq_ex.read_opcode = cq_read_opcode;
+	cq->vcq.cq_ex.read_vendor_err = cq_read_vendor_err;
+	cq->vcq.cq_ex.read_wc_flags = cq_read_wc_flags;
+
+	if (attr->wc_flags & IBV_WC_EX_WITH_BYTE_LEN)
+		cq->vcq.cq_ex.read_byte_len = cq_read_byte_len;
+
+	if (attr->wc_flags & IBV_WC_EX_WITH_IMM)
+		cq->vcq.cq_ex.read_imm_data = cq_read_imm_data;
+
+	if (attr->wc_flags & IBV_WC_EX_WITH_QP_NUM)
+		cq->vcq.cq_ex.read_qp_num = cq_read_qp_num;
+
+	if (attr->wc_flags & IBV_WC_EX_WITH_SRC_QP)
+		cq->vcq.cq_ex.read_src_qp = cq_read_src_qp;
+
+	if (attr->wc_flags & IBV_WC_EX_WITH_SLID)
+		cq->vcq.cq_ex.read_slid = cq_read_slid;
+
+	if (attr->wc_flags & IBV_WC_EX_WITH_SL)
+		cq->vcq.cq_ex.read_sl = cq_read_sl;
+
+	return &cq->vcq.cq_ex;
+
+err_destroy:
+	ibv_cmd_destroy_cq(&cq->vcq.cq);
+err_free:
+	free(cq);
+err:
+
+	return NULL;
 }
 
 static int map_queue_pair(int cmd_fd, struct grvf_qp *qp,
@@ -281,10 +513,11 @@ static int map_queue_pair(int cmd_fd, struct grvf_qp *qp,
 	return 0;
 }
 
-static struct ibv_qp *grvf_create_qp(struct ibv_pd *pd,
+static struct ibv_qp *grvf_create_qp(struct ibv_pd *ibvpd,
 				     struct ibv_qp_init_attr *attr)
 {
 	struct grvf_qp *qp;
+	struct grvf_pd *pd = container_of(ibvpd, struct grvf_pd, ibvpd);
 	struct ibv_create_qp cmd;
 	struct grvf_create_qp_resp resp;
 	int ret;
@@ -293,31 +526,84 @@ static struct ibv_qp *grvf_create_qp(struct ibv_pd *pd,
 	if (!qp)
 		return NULL;
 
-	ret = ibv_cmd_create_qp(pd, &qp->vqp.qp, attr, &cmd, sizeof(cmd),
+	qp->sq.wr_dmp = calloc(0x40, sizeof(union sq_entry_t));
+	if (!qp->sq.wr_dmp) {
+		free(qp);
+		return NULL;
+	}
+
+	ret = ibv_cmd_create_qp(ibvpd, &qp->vqp.qp, attr, &cmd, sizeof(cmd),
 				&resp.ibv_resp, sizeof(resp));
 	if (ret) {
-		verbs_err(verbs_get_ctx(pd->context), "Failed to create QP\n");
+		verbs_err(verbs_get_ctx(ibvpd->context),
+			  "Failed to create QP\n");
 		errno = ret;
 		free(qp);
 		return NULL;
 	}
 
-	ret = map_queue_pair(pd->context->cmd_fd, qp, attr, &resp.drv_payload);
+	ret = map_queue_pair(ibvpd->context->cmd_fd, qp, attr,
+			     &resp.drv_payload);
 	if (ret) {
-		verbs_err(verbs_get_ctx(pd->context), "Failed mapping QP\n");
+		verbs_err(verbs_get_ctx(ibvpd->context), "Failed mapping QP\n");
 		ibv_cmd_destroy_qp(&qp->vqp.qp);
 		free(qp);
 		return NULL;
 	}
 
-	qp->inline_buf = malloc(attr->cap.max_inline_data);
-	if (!qp->inline_buf) {
-		ibv_cmd_destroy_qp(&qp->vqp.qp);
-		free(qp);
-		return NULL;
-	}
+	qp->pd = pd;
 
 	return &qp->vqp.qp;
+}
+
+static struct ibv_qp *grvf_create_qp_ex(struct ibv_context *context,
+					struct ibv_qp_init_attr_ex *attr)
+{
+	int ret;
+	struct grvf_qp *qp;
+	struct ibv_create_qp_ex cmd = {};
+	struct grvf_create_qp_ex_resp resp = {};
+
+	qp = calloc(1, sizeof(*qp));
+	if (!qp)
+		return NULL;
+
+	qp->sq.wr_dmp = calloc(0x40, sizeof(union sq_entry_t));
+	if (!qp->sq.wr_dmp) {
+		goto err_free;
+	}
+
+	if (attr->comp_mask & IBV_QP_INIT_ATTR_SEND_OPS_FLAGS) {
+		set_qp_send_ops(qp, attr->send_ops_flags);
+	}
+
+	ret = ibv_cmd_create_qp_ex2(context, &qp->vqp, attr, &cmd, sizeof(cmd),
+				    &resp.ibv_resp, sizeof(resp));
+	if (ret) {
+		verbs_err(verbs_get_ctx(context), "Failed to create EX QP\n");
+		goto err_sq_free;
+	}
+
+	ret = map_queue_pair(context->cmd_fd, qp,
+			     (struct ibv_qp_init_attr *)attr,
+			     &resp.drv_payload);
+	if (ret) {
+		verbs_err(verbs_get_ctx(context), "Failed mapping QP\n");
+		goto err_destroy;
+	}
+
+	qp->pd = container_of(attr->pd, struct grvf_pd, ibvpd);
+	qp->vqp.comp_mask |= VERBS_QP_EX;
+
+	return &qp->vqp.qp;
+
+err_destroy:
+	ibv_cmd_destroy_qp(&qp->vqp.qp);
+err_sq_free:
+	free(qp->sq.wr_dmp);
+err_free:
+	free(qp);
+	return NULL;
 }
 
 static struct ibv_srq *grvf_create_srq(struct ibv_pd *pd,
@@ -378,26 +664,13 @@ static struct ibv_srq *grvf_create_srq(struct ibv_pd *pd,
 	return &srq->vsrq.srq;
 }
 
-static int grvf_dealloc_mw(struct ibv_mw *mw)
+static int grvf_dealloc_pd(struct ibv_pd *ibvpd)
 {
-	struct verbs_context *ctx = verbs_get_ctx(mw->context);
+	struct grvf_pd *pd = container_of(ibvpd, struct grvf_pd, ibvpd);
+	struct verbs_context *ctx = verbs_get_ctx(ibvpd->context);
 	int ret;
 
-	ret = ibv_cmd_dealloc_mw(mw);
-	if (ret)
-		verbs_err(ctx, "Failed to deallocate MW\n");
-	else
-		free(mw);
-
-	return ret;
-}
-
-static int grvf_dealloc_pd(struct ibv_pd *pd)
-{
-	struct verbs_context *ctx = verbs_get_ctx(pd->context);
-	int ret;
-
-	ret = ibv_cmd_dealloc_pd(pd);
+	ret = ibv_cmd_dealloc_pd(&pd->ibvpd);
 	if (ret)
 		verbs_err(ctx, "Failed to deallocate PD\n");
 	else
@@ -474,6 +747,7 @@ static int grvf_destroy_qp(struct ibv_qp *qp)
 	if (p->sq.db_mmap_info.size)
 		munmap(p->sq.wq.db_dev, p->sq.db_mmap_info.size);
 
+	free(p->sq.wr_dmp);
 	free(p);
 	return 0;
 }
@@ -501,11 +775,25 @@ static int grvf_destroy_srq(struct ibv_srq *srq)
 
 static void grvf_free_context(struct ibv_context *context)
 {
-	struct grvf_context *ctx =
-		container_of(context, struct grvf_context, ibv_ctx.context);
+	struct grvf_context *ctx = to_gctx(context);
 
 	verbs_uninit_context(&ctx->ibv_ctx);
 	free(ctx);
+}
+
+static int grvf_free_dm(struct ibv_dm *dm)
+{
+	struct grvf_dm *p = container_of(dm, struct grvf_dm, vdm.dm);
+	int ret;
+
+	ret = ibv_cmd_free_dm(&p->vdm);
+	if (ret) {
+		verbs_err(verbs_get_ctx(dm->context), "Failed to free DM\n");
+		return ret;
+	}
+
+	free(p);
+	return 0;
 }
 
 static int grvf_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
@@ -528,6 +816,31 @@ static int grvf_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 
 	p->cur_qp_state = attr->qp_state;
 	p->sq.psn = attr->sq_psn;
+
+	return 0;
+}
+
+int grvfdv_modify_qp_custom(struct ibv_qp *ibvqp,
+			    struct grvfdv_qp_custom_attr *attr, int attr_mask)
+{
+	int ret;
+
+	DECLARE_COMMAND_BUFFER(cmd, UVERBS_OBJECT_QP,
+			       GRVF_IB_METHOD_MODIFY_QP_CUSTOM, 3);
+
+	fill_attr_in_obj(cmd, GRVF_IB_ATTR_MODIFY_QP_CUSTOM_HANDLE,
+			 ibvqp->handle);
+	fill_attr_in(cmd, GRVF_IB_ATTR_MODIFY_QP_ATTRS, attr,
+		     sizeof(struct grvfdv_qp_custom_attr));
+	fill_attr_in(cmd, GRVF_IB_ATTR_MODIFY_QP_MASK, &attr_mask,
+		     sizeof(attr_mask));
+
+	ret = execute_ioctl(ibvqp->context, cmd);
+	if (ret) {
+		verbs_err(verbs_get_ctx(ibvqp->context),
+			  "Failed to modify QP custom attributes\n");
+		return ret;
+	}
 
 	return 0;
 }
@@ -555,21 +868,15 @@ static int grvf_modify_srq(struct ibv_srq *srq, struct ibv_srq_attr *srq_attr,
 	return ret;
 }
 
-#define READ_CQ(entry, member, cq)                                             \
-	(entry.member) =                                                       \
-		mmio_read64(&((cq)->dev[((cq)->cons << CQ_ENTRY_STRIDE_BITS) + \
-					offsetof(typeof(entry), member)]))
-
-#define WRITE_CQ(entry, member, cq, val)                                       \
-	mmio_write64(&((cq)->dev[((cq)->cons << CQ_ENTRY_STRIDE_BITS) +        \
-				 offsetof(typeof(entry), member)]),            \
-		     (val))
-
 static int grvf_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc)
 {
+	struct grvf_context *ctx = to_gctx(cq->context);
 	struct grvf_cq *q = container_of(cq, struct grvf_cq, vcq.cq);
 	struct cq_entry_t wc_dev;
 	int npolled;
+
+	if (!ctx->ibv_active)
+		return -EAGAIN;
 
 	pthread_spin_lock(&q->lock);
 
@@ -611,9 +918,13 @@ static int grvf_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc)
 static int grvf_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
 			  struct ibv_recv_wr **bad_wr)
 {
+	struct grvf_context *ctx = to_gctx(qp->context);
 	struct grvf_qp *q = container_of(qp, struct grvf_qp, vqp.qp);
 	int ret = 0;
 	int nreq;
+
+	if (!ctx->ibv_active)
+		return -EAGAIN;
 
 	pthread_spin_lock(&q->rq.wq.lock);
 
@@ -635,9 +946,13 @@ static int grvf_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
 static int grvf_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
 			  struct ibv_send_wr **bad_wr)
 {
+	struct grvf_context *ctx = to_gctx(qp->context);
 	struct grvf_qp *q = container_of(qp, struct grvf_qp, vqp.qp);
 	int ret = 0;
 	int nreq;
+
+	if (!ctx->ibv_active)
+		return -EAGAIN;
 
 	pthread_spin_lock(&q->sq.wq.lock);
 
@@ -659,9 +974,13 @@ static int grvf_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
 static int grvf_post_srq_recv(struct ibv_srq *srq, struct ibv_recv_wr *recv_wr,
 			      struct ibv_recv_wr **bad_recv_wr)
 {
+	struct grvf_context *ctx = to_gctx(srq->context);
 	struct grvf_srq *q = container_of(srq, struct grvf_srq, vsrq.srq);
 	int ret = 0;
 	int nreq;
+
+	if (!ctx->ibv_active)
+		return -EAGAIN;
 
 	pthread_spin_lock(&q->rq.wq.lock);
 
@@ -733,6 +1052,37 @@ static int grvf_query_srq(struct ibv_srq *srq, struct ibv_srq_attr *srq_attr)
 	return ibv_cmd_query_srq(srq, srq_attr, &cmd, sizeof(cmd));
 }
 
+static struct ibv_mr *grvf_reg_dm_mr(struct ibv_pd *pd, struct ibv_dm *dm,
+				     uint64_t dm_offset, size_t length,
+				     unsigned int access)
+{
+	struct grvf_dm *p = container_of(dm, struct grvf_dm, vdm.dm);
+	struct verbs_mr *vmr;
+	int ret;
+
+	if (access & ~(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+		       IBV_ACCESS_REMOTE_READ | IBV_ACCESS_ZERO_BASED)) {
+		errno = EINVAL;
+		return NULL;
+	}
+
+	vmr = calloc(1, sizeof(*vmr));
+	if (!vmr)
+		return NULL;
+
+	ret = ibv_cmd_reg_dm_mr(pd, &p->vdm, dm_offset, length, access, vmr,
+				NULL);
+	if (ret) {
+		verbs_err(verbs_get_ctx(dm->context),
+			  "Failed to register MR\n");
+		errno = ret;
+		free(vmr);
+		return NULL;
+	}
+
+	return &vmr->ibv_mr;
+}
+
 static struct ibv_mr *grvf_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 				  uint64_t hca_va, int access)
 {
@@ -758,16 +1108,90 @@ static struct ibv_mr *grvf_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 	return &vmr->ibv_mr;
 }
 
+static int grvfdv_query_dbg_mon(struct ibv_context *context, uint16_t method_id,
+				uint16_t type_id, uint16_t counter_id,
+				uint32_t event_type, uint32_t *counter)
+{
+	int ret;
+
+	DECLARE_COMMAND_BUFFER(cmd, GRVF_IB_OBJECT_DBG_MON, method_id, 2);
+
+	fill_attr_in(cmd, type_id, &event_type, sizeof(event_type));
+	fill_attr_out(cmd, counter_id, counter, sizeof(uint32_t));
+
+	ret = execute_ioctl(context, cmd);
+	if (ret) {
+		verbs_err(verbs_get_ctx(context), "Failed to query dbg mon\n");
+		return ret;
+	}
+
+	return 0;
+}
+
+int grvfdv_query_tx_dbg_mon(struct ibv_context *context,
+			    enum grvfdv_dbg_mon_tx_events_type event_type,
+			    uint32_t *counter)
+{
+	return grvfdv_query_dbg_mon(context, GRVF_IB_METHOD_QUERY_TX_DBG_MON,
+				    GRVF_IB_ATTR_QUERY_TX_DBG_MON_TYPE,
+				    GRVF_IB_ATTR_QUERY_TX_DBG_MON_COUNTER,
+				    event_type, counter);
+}
+
+int grvfdv_query_rx_dbg_mon(struct ibv_context *context,
+			    enum grvfdv_dbg_mon_rx_events_type event_type,
+			    uint32_t *counter)
+{
+	return grvfdv_query_dbg_mon(context, GRVF_IB_METHOD_QUERY_RX_DBG_MON,
+				    GRVF_IB_ATTR_QUERY_RX_DBG_MON_TYPE,
+				    GRVF_IB_ATTR_QUERY_RX_DBG_MON_COUNTER,
+				    event_type, counter);
+}
+
+int grvfdv_query_global_dbg_mon(
+	struct ibv_context *context,
+	enum grvfdv_dbg_mon_global_events_type event_type, uint32_t *counter)
+{
+	return grvfdv_query_dbg_mon(context,
+				    GRVF_IB_METHOD_QUERY_GLOBAL_DBG_MON,
+				    GRVF_IB_ATTR_QUERY_GLOBAL_DBG_MON_TYPE,
+				    GRVF_IB_ATTR_QUERY_GLOBAL_DBG_MON_COUNTER,
+				    event_type, counter);
+}
+
+int grvfdv_query_cnp(struct ibv_qp *ibvqp,
+		     struct grvfdv_congestion_cnp_attrs *attr)
+{
+	int ret;
+
+	DECLARE_COMMAND_BUFFER(cmd, UVERBS_OBJECT_QP, GRVF_IB_METHOD_QUERY_CNP,
+			       2);
+
+	fill_attr_in_obj(cmd, GRVF_IB_ATTR_QUERY_CPN_HANDLE, ibvqp->handle);
+	fill_attr_out(cmd, GRVF_IB_ATTR_QUERY_CPN_INFO_ATTRS, attr,
+		      sizeof(struct grvfdv_congestion_cnp_attrs));
+
+	ret = execute_ioctl(ibvqp->context, cmd);
+	if (ret) {
+		verbs_err(verbs_get_ctx(ibvqp->context),
+			  "Failed to query CNP\n");
+		return ret;
+	}
+
+	return 0;
+}
+
 static const struct verbs_context_ops grvf_ctx_ops = {
-	.alloc_mw = grvf_alloc_mw,
+	.async_event = grvf_async_event,
+	.alloc_dm = grvf_alloc_dm,
 	.alloc_pd = grvf_alloc_pd,
 	.attach_mcast = ibv_cmd_attach_mcast,
-	.bind_mw = grvf_bind_mw,
 	.create_ah = grvf_create_ah,
 	.create_cq = grvf_create_cq,
+	.create_cq_ex = grvf_create_cq_ex,
 	.create_qp = grvf_create_qp,
+	.create_qp_ex = grvf_create_qp_ex,
 	.create_srq = grvf_create_srq,
-	.dealloc_mw = grvf_dealloc_mw,
 	.dealloc_pd = grvf_dealloc_pd,
 	.dereg_mr = grvf_dereg_mr,
 	.destroy_ah = grvf_destroy_ah,
@@ -776,6 +1200,7 @@ static const struct verbs_context_ops grvf_ctx_ops = {
 	.destroy_srq = grvf_destroy_srq,
 	.detach_mcast = ibv_cmd_detach_mcast,
 	.free_context = grvf_free_context,
+	.free_dm = grvf_free_dm,
 	.modify_qp = grvf_modify_qp,
 	.modify_srq = grvf_modify_srq,
 	.poll_cq = grvf_poll_cq,
@@ -786,6 +1211,7 @@ static const struct verbs_context_ops grvf_ctx_ops = {
 	.query_port = grvf_query_port,
 	.query_qp = grvf_query_qp,
 	.query_srq = grvf_query_srq,
+	.reg_dm_mr = grvf_reg_dm_mr,
 	.reg_mr = grvf_reg_mr,
 	.req_notify_cq = ibv_cmd_req_notify_cq,
 };
@@ -803,8 +1229,8 @@ static struct verbs_context *grvf_alloc_context(struct ibv_device *device,
 	if (!context)
 		return NULL;
 
-	ret = ibv_cmd_get_context(&context->ibv_ctx, &cmd, sizeof(cmd), NULL,
-				  &resp, sizeof(resp));
+	ret = ibv_cmd_get_context(&context->ibv_ctx, &cmd, sizeof(cmd), &resp,
+				  sizeof(resp));
 	if (ret) {
 		verbs_err(&context->ibv_ctx,
 			  "Failed to get ucontext, err: %d\n", ret);
@@ -815,6 +1241,7 @@ static struct verbs_context *grvf_alloc_context(struct ibv_device *device,
 	}
 
 	verbs_set_ops(&context->ibv_ctx, &grvf_ctx_ops);
+	context->ibv_active = true;
 
 	verbs_debug(&context->ibv_ctx, "Allocate context successful\n", ret);
 	return &context->ibv_ctx;

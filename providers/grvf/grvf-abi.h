@@ -12,12 +12,22 @@
 
 #define GRVF_ABI_VERSION 1
 
-DECLARE_DRV_CMD(grvf_create_ah, IB_USER_VERBS_CMD_CREATE_AH, empty, empty);
+DECLARE_DRV_CMD(grvf_create_ah, IB_USER_VERBS_CMD_CREATE_AH, empty,
+		grvf_ib_create_ah_resp);
+
+DECLARE_DRV_CMD(grvf_alloc_pd, IB_USER_VERBS_CMD_ALLOC_PD, empty,
+		grvf_ib_alloc_pd_resp);
 
 DECLARE_DRV_CMD(grvf_create_cq, IB_USER_VERBS_CMD_CREATE_CQ, empty,
 		grvf_ib_create_cq_resp);
 
+DECLARE_DRV_CMD(grvf_create_cq_ex, IB_USER_VERBS_EX_CMD_CREATE_CQ, empty,
+		grvf_ib_create_cq_resp);
+
 DECLARE_DRV_CMD(grvf_create_qp, IB_USER_VERBS_CMD_CREATE_QP, empty,
+		grvf_ib_create_qp_resp);
+
+DECLARE_DRV_CMD(grvf_create_qp_ex, IB_USER_VERBS_EX_CMD_CREATE_QP, empty,
 		grvf_ib_create_qp_resp);
 
 DECLARE_DRV_CMD(grvf_create_srq, IB_USER_VERBS_CMD_CREATE_SRQ, empty,

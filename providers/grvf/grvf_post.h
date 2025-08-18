@@ -14,4 +14,6 @@ int grvf_post_one_recv(struct grvf_rq *rq, struct ibv_recv_wr *wr);
 void grvf_post_send_db(struct grvf_sq *sq, uint32_t wr_count);
 void grvf_post_recv_db(struct grvf_rq *rq, uint32_t wr_count);
 
+void set_qp_send_ops(struct grvf_qp *qp, uint64_t flags);
+
 #endif

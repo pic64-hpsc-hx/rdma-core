@@ -17,11 +17,23 @@ struct grvf_device {
 
 struct grvf_context {
 	struct verbs_context ibv_ctx;
+	uint8_t ibv_active : 1;
+};
+
+struct grvf_dm {
+	struct verbs_dm vdm;
+	size_t length;
 };
 
 struct grvf_ah {
 	struct ibv_ah ibv_ah;
 	struct grvf_av av;
+};
+
+struct grvf_pd {
+	struct ibv_pd ibvpd;
+
+	uint32_t index;
 };
 
 struct grvf_cq {
@@ -31,7 +43,7 @@ struct grvf_cq {
 	pthread_spinlock_t lock;
 
 	/* new API support */
-	struct ib_uverbs_wc *wc;
+	struct ib_uverbs_wc wc;
 	size_t wc_size;
 	uint32_t cur_index;
 
@@ -76,20 +88,25 @@ struct grvf_sq {
 	uint32_t wr_size_elements;
 	uint32_t wr_count_mask;
 	uint32_t psn;
+
+	union sq_entry_t *wr_dmp;
+
+	/* new API support */
+	int err;
+	uint32_t prod_tmp;
+	uint32_t wr_count;
+	uint32_t psn_tmp;
+	uint32_t psn_first;
 };
 
 struct grvf_qp {
 	struct verbs_qp vqp;
+	struct grvf_pd *pd;
 	struct grvf_rq rq;
 	struct grvf_sq sq;
 
-	/* new API support */
-	uint32_t cur_index;
-	int err;
-
 	enum ibv_qp_state cur_qp_state;
 	enum ibv_qp_type qp_type;
-	uint8_t *inline_buf;
 	enum ibv_mtu path_mtu;
 };
 
@@ -97,5 +114,10 @@ struct grvf_srq {
 	struct verbs_srq vsrq;
 	struct grvf_rq rq;
 };
+
+static inline struct grvf_context *to_gctx(struct ibv_context *ibctx)
+{
+	return container_of(ibctx, struct grvf_context, ibv_ctx.context);
+}
 
 #endif
